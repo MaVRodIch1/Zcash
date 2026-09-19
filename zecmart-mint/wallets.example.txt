@@ -1,0 +1,11 @@
+# One wallet address per line — the addresses of the Noir Wallet accounts you control.
+# Copy this file to wallets.txt (wallets.txt is git-ignored) and fill it in.
+#
+# Get each address from Noir Wallet: Receive -> copy address, for every account.
+# Blank lines and everything after "#" is ignored.
+#
+# For collections that need an explicit ZSA receiver, use: <address>,<zsaRecipient>
+# ZecPuppets does not (recipientModel = not_required).
+
+t1ExampleTransparentAddressReplaceMe
+u1ExampleUnifiedAddressReplaceMe
