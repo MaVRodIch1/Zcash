@@ -17,6 +17,9 @@
  *   --concurrency <n>    parallel in-flight orders (default: 4)
  *   --gap <ms>           spacing between order starts (default: 300) — the mint
  *                        endpoint answers a burst with a 1-hour IP ban
+ *   --poll-ms <ms>       how often to re-check launchAt while waiting (default:
+ *                        600000). Rarely, on purpose: the countdown must not
+ *                        spend the IP's rate budget before the drop.
  *   --lead-ms <n>        fire this many ms before launchAt (default: 250)
  *   --attempts <n>       retry attempts per wallet on transient errors (default: 40)
  *   --base <url>         API base (default: https://zecmart.com)
@@ -57,6 +60,7 @@ const ATTEMPTS = int(args.attempts, 40);
 const DRY_RUN = !!args['dry-run'];
 const WARM = args['no-warm'] ? 0 : int(args.warm, CONCURRENCY);
 const GAP = int(args.gap, 300);  // ms between order starts; the endpoint bans bursts
+const POLL_MS = Math.max(60_000, int(args['poll-ms'], 600_000));  // countdown polling interval
 
 // Errors that mean "not open yet / server busy" — worth retrying.
 const RETRYABLE = new Set([
@@ -221,19 +225,22 @@ async function waitForLaunch() {
   const target = Date.parse(launch.launchAt) - LEAD_MS;
   log(`launch at ${launch.launchAt} (in ${fmtDuration(target - serverNow())})`);
 
+  let synced = false;
   while (serverNow() < target) {
     const left = target - serverNow();
-    // Poll the launch endpoint occasionally in case the team moves the time,
-    // and re-sync the clock as the moment approaches.
+    // Poll rarely. The API rate-limits per IP and a 429 carries an hour-long
+    // Retry-After, so a long wait must not spend the budget on the countdown:
+    // once every 10 minutes is enough to notice a moved launchAt.
     if (left > 120_000) {
-      await sleep(Math.min(left - 60_000, 60_000));
+      await sleep(Math.min(left - 60_000, POLL_MS));
       launch = await api('/api/mint/launch').catch(() => launch);
       if (launch.launchStarted) { log('sale opened early'); return; }
       const moved = Date.parse(launch.launchAt) - LEAD_MS;
       if (moved !== target) { log(`launchAt moved to ${launch.launchAt}`); return waitForLaunch(); }
       log(`waiting... ${fmtDuration(target - serverNow())} left`);
     } else if (left > 5_000) {
-      await syncClock();
+      // One clock re-sync near the end, not one per loop.
+      if (!synced) { synced = true; await syncClock(); }
       await sleep(Math.min(left - 2_000, 20_000));
     } else {
       if (!warmed) { warmed = true; await warmUp(); }
