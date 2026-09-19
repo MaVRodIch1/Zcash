@@ -13,7 +13,8 @@
  *
  * Flags:
  *   --wallets <file>   address list (default wallets.txt)
- *   --secret <file>    secret file, used only for labels (default wallets-secret.json)
+ *   --secret <file>    secret file, used only for labels
+ *                      (default $ZECMART_SECRET, else wallets-secret.json)
  *   --orders <file>    a results-*.json from mint.mjs, to cross-check orders vs items
  *   --json <file>      also write the report as JSON
  *   --base <url>       API base (default https://zecmart.com)
@@ -29,7 +30,7 @@ const BATCH = int(args.batch, 20);
 main().catch((err) => { console.error(`error: ${err.message}`); process.exit(1); });
 
 async function main() {
-  const labels = await loadLabels(args.secret ?? 'wallets-secret.json');
+  const labels = await loadLabels(args.secret ?? process.env.ZECMART_SECRET ?? 'wallets-secret.json');
   const addresses = await loadAddresses(args.wallets ?? 'wallets.txt', labels);
   if (!addresses.length) throw new Error('no wallet addresses found');
 

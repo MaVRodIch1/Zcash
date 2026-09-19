@@ -22,7 +22,7 @@
  *                      accounts: ONE seed phrase, N accounts derived from it
  *                                (one import instead of N — but only correct if
  *                                the wallet uses the same account-index scheme)
- *   --secret <file>    default wallets-secret.json
+ *   --secret <file>    default $ZECMART_SECRET, else wallets-secret.json
  *   --addresses <file> default wallets.txt
  *   --append           add to the existing files instead of refusing
  *   --force            overwrite existing files
@@ -36,7 +36,9 @@ import {
 } from './wallet-lib.mjs';
 
 const args = parseArgs(process.argv.slice(2));
-const SECRET_FILE = args.secret ?? 'wallets-secret.json';
+// Keep the seed phrases out of the project folder when you can: an IDE that
+// indexes the project (PyCharm's Local History, for one) may keep copies.
+const SECRET_FILE = args.secret ?? process.env.ZECMART_SECRET ?? 'wallets-secret.json';
 const ADDRESS_FILE = args.addresses ?? 'wallets.txt';
 
 main().catch((err) => { console.error(`error: ${err.message}`); process.exit(1); });

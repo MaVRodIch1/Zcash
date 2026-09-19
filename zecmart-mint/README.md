@@ -90,6 +90,21 @@ the NFT lands somewhere nobody controls.
 Generate the wallets on the machine that will keep them, not on a shared or remote
 box, and back up `wallets-secret.json` somewhere offline before minting.
 
+Better still, keep the secret file outside the project directory — an IDE that indexes
+the project can retain copies of it (PyCharm's Local History does). Set `ZECMART_SECRET`
+once and every script picks it up:
+
+```powershell
+$env:ZECMART_SECRET = "$env:USERPROFILE\Documents\zec\wallets-secret.json"
+```
+
+```bash
+export ZECMART_SECRET=~/zec/wallets-secret.json
+```
+
+Only `wallets.txt` (addresses) is needed to mint, so a machine that runs the sniper
+never needs the seed phrases at all.
+
 ## Reading the results
 
 ```bash
