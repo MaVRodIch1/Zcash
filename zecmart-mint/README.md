@@ -110,7 +110,10 @@ Wallet its items show up there too.
 | `--wallets <file>` | `wallets.txt` | Addresses, one per line |
 | `--collection <slug>` | `zecpuppets` | Collection slug |
 | `--quantity <n>` | `maxPerOrder` (2) | NFTs per wallet, capped to the server limit |
-| `--concurrency <n>` | `5` | Orders in flight at once |
+| `--concurrency <n>` | `4` | Orders in flight at once |
+| `--gap <ms>` | `300` | Spacing between order starts |
+| `--warm <n>` | `= concurrency` | Connections opened before launch |
+| `--no-warm` | off | Skip connection pre-warming |
 | `--lead-ms <n>` | `250` | Fire this many ms before `launchAt` |
 | `--attempts <n>` | `40` | Retries per wallet on transient errors |
 | `--now` | off | Skip the countdown, fire immediately |
@@ -134,6 +137,44 @@ Wallet its items show up there too.
    jittered backoff; stops a wallet on `WALLET_LIMIT_REACHED` / invalid address, and
    stops the run on `SOLD_OUT`.
 7. Polls each order to its final status and writes `results-<timestamp>.json`.
+
+## The rate limit is the real constraint
+
+The order endpoint rate-limits **per IP**, and it does not answer a burst with a
+polite slowdown — it answers with `HTTP 429` and `Retry-After: 3600`. One hour,
+which is longer than any drop. Measured, not guessed: eight warm-up GETs plus a
+single POST from one address was enough to trigger it.
+
+What follows from that:
+
+- **More wallets do not mean more NFTs.** Past some number, the run gets banned
+  partway through and the remaining wallets get nothing. A paced 20 beats a
+  stampeding 100.
+- `--gap 300` (the default) spaces the orders. Lower it only if you have reason to
+  think the limit is looser than it looked; `--gap 500` is the cautious direction.
+- On a 429 with a long `Retry-After` the run **stops** instead of retrying. Hammering
+  a one-hour ban cannot succeed and only adds load.
+- Warm-up runs against a static page, not the API, so handshakes do not spend the
+  API's rate budget.
+
+Spreading the orders over many IPs is what would get around this, and that is exactly
+what the limiter exists to prevent. This tooling does not do it.
+
+## Speed
+
+Ordered by how much they actually buy you:
+
+1. **Pre-warmed connections** (on by default). At t=0 a fresh TLS handshake costs more
+   than the request: measured 143 ms cold vs 21 ms on a pooled connection. `undici`
+   holds the pool open (`keepAliveTimeout` 30 s, since its default 4 s is too short to
+   pre-warm), and the warm-up fires a couple of seconds before launch.
+2. **Ordering and confirmation are separate passes.** Polling an order to COMPLETED
+   used to hold a worker slot for seconds while other wallets waited to order.
+3. **`--lead-ms`** — fire slightly before `launchAt` so the request lands as the gate
+   opens. 250 ms by default; raise it on a slow link.
+4. **Where you run it.** The site sits behind Google Frontend, so a VPS on decent
+   network beats a home connection — but this is worth tens of milliseconds, while
+   the rate limit above is worth the whole run.
 
 ## Notes
 

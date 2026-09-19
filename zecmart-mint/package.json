@@ -4,7 +4,9 @@
   "private": true,
   "type": "module",
   "description": "ZecMart launchpad mint runner, wallet generator and post-drop report",
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "gen": "node gen-wallets.mjs",
     "verify": "node gen-wallets.mjs --verify",
@@ -15,6 +17,7 @@
     "@noble/hashes": "^2.4.0",
     "@scure/base": "^2.4.0",
     "@scure/bip32": "^2.4.0",
-    "@scure/bip39": "^2.4.0"
+    "@scure/bip39": "^2.4.0",
+    "undici": "^8.10.2"
   }
 }

@@ -14,27 +14,49 @@
  *   --wallets <file>     newline separated wallet addresses (default: wallets.txt)
  *   --collection <slug>  collection slug (default: zecpuppets)
  *   --quantity <n>       NFTs per wallet, capped to maxPerOrder (default: maxPerOrder)
- *   --concurrency <n>    parallel in-flight orders (default: 5)
+ *   --concurrency <n>    parallel in-flight orders (default: 4)
+ *   --gap <ms>           spacing between order starts (default: 300) — the mint
+ *                        endpoint answers a burst with a 1-hour IP ban
  *   --lead-ms <n>        fire this many ms before launchAt (default: 250)
  *   --attempts <n>       retry attempts per wallet on transient errors (default: 40)
  *   --base <url>         API base (default: https://zecmart.com)
  *   --now                skip the launch countdown and fire immediately
  *   --skip-preflight     do not validate addresses/allowances before firing
  *   --dry-run            run every check, but never POST an order
+ *   --warm <n>           connections to open before launch (default: concurrency)
+ *   --no-warm            skip connection pre-warming
  *   --allow-paid         proceed even if the collection is not a free mint
  */
 
 import fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 
+// Keep-alive pool: at t=0 a fresh TLS handshake costs more than the request
+// itself, so orders must go out over connections that are already open.
+let poolReady = false;
+try {
+  const { setGlobalDispatcher, Agent } = await import('undici');
+  setGlobalDispatcher(new Agent({
+    connections: 64,          // per origin, plenty for any sane wallet count
+    keepAliveTimeout: 30_000, // undici defaults to 4s idle — far too short to pre-warm
+    keepAliveMaxTimeout: 120_000,
+    connect: { timeout: 10_000 },
+  }));
+  poolReady = true;
+} catch {
+  // undici is optional; without it Node's default pool still works, just colder.
+}
+
 const args = parseArgs(process.argv.slice(2));
 const BASE = (args.base ?? 'https://zecmart.com').replace(/\/+$/, '');
 const COLLECTION = args.collection ?? 'zecpuppets';
 const WALLET_FILE = args.wallets ?? 'wallets.txt';
-const CONCURRENCY = int(args.concurrency, 5);
+const CONCURRENCY = int(args.concurrency, 4);
 const LEAD_MS = int(args['lead-ms'], 250);
 const ATTEMPTS = int(args.attempts, 40);
 const DRY_RUN = !!args['dry-run'];
+const WARM = args['no-warm'] ? 0 : int(args.warm, CONCURRENCY);
+const GAP = int(args.gap, 300);  // ms between order starts; the endpoint bans bursts
 
 // Errors that mean "not open yet / server busy" — worth retrying.
 const RETRYABLE = new Set([
@@ -52,6 +74,7 @@ const GLOBAL_FATAL = new Set(['SOLD_OUT', 'NO_INVENTORY', 'INVENTORY_EXHAUSTED']
 
 let clockOffsetMs = 0;   // serverNow - localNow
 let soldOut = false;
+let rateLimited = false;   // set when the server answers 429 with a long Retry-After
 
 main().catch((err) => { console.error('fatal:', err.message); process.exit(1); });
 
@@ -82,9 +105,14 @@ async function main() {
 
   await syncClock();
   if (!args['skip-preflight']) await preflight(wallets);
-  if (!args.now) await waitForLaunch();
+  if (args.now) await warmUp();
+  else await waitForLaunch();
 
+  const t0 = Date.now();
   const results = await runPool(wallets, CONCURRENCY, (w) => mintOne(w, quantity));
+  log(`all orders sent in ${Date.now() - t0} ms`);
+
+  await confirmAll(results);
 
   const ok = results.filter((r) => r.ok);
   const failed = results.filter((r) => !r.ok);
@@ -184,6 +212,8 @@ async function syncClock() {
 
 const serverNow = () => Date.now() + clockOffsetMs;
 
+let warmed = false;
+
 async function waitForLaunch() {
   let launch = await api('/api/mint/launch');
   if (launch.launchStarted) { log('sale already open'); return; }
@@ -206,13 +236,28 @@ async function waitForLaunch() {
       await syncClock();
       await sleep(Math.min(left - 2_000, 20_000));
     } else {
+      if (!warmed) { warmed = true; await warmUp(); }
       await sleep(Math.min(left, 25)); // busy-ish wait only for the last seconds
     }
   }
+  if (!warmed) await warmUp();
   log('launch window reached — firing orders');
 }
 
 /* ------------------------------------------------------------------- mint */
+
+/**
+ * Orders are spaced by GAP ms. The mint endpoint rate-limits per IP and answers
+ * a burst with a one-hour Retry-After, so a measured stream places more orders
+ * than a stampede does.
+ */
+let nextSlot = 0;
+async function takeSlot() {
+  const now = Date.now();
+  const at = Math.max(now, nextSlot);
+  nextSlot = at + GAP;
+  if (at > now) await sleep(at - now);
+}
 
 async function mintOne(wallet, quantity) {
   if (wallet.remaining === 0) return { ok: false, wallet: wallet.address, error: 'allowance already 0' };
@@ -220,7 +265,9 @@ async function mintOne(wallet, quantity) {
   let delay = 150;
   for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
     if (soldOut) return { ok: false, wallet: wallet.address, error: 'sold out' };
+    if (rateLimited) return { ok: false, wallet: wallet.address, error: 'skipped: rate limited' };
     try {
+      await takeSlot();   // also in a dry run, so the rehearsal shows real timing
       if (DRY_RUN) {
         log(`[dry-run] would POST order for ${short(wallet.address)} qty=${quantity}`);
         return { ok: true, wallet: wallet.address, dryRun: true };
@@ -237,12 +284,26 @@ async function mintOne(wallet, quantity) {
         body: JSON.stringify(body),
       });
       log(`ordered ${short(wallet.address)} -> ${order.id} status=${order.status} delivery=${order.deliveryStatus ?? '-'}`);
-      const final = await confirm(order);
-      return { ok: true, wallet: wallet.address, orderId: order.id, status: final.status,
-               deliveryStatus: final.deliveryStatus, paymentAddress: order.paymentAddress,
-               totalPriceZec: order.totalPriceZec, attempt };
+      // Confirmation happens in a second pass: polling here would hold a pool
+      // slot for seconds while other wallets are still waiting to order.
+      return { ok: true, wallet: wallet.address, label: wallet.label, orderId: order.id,
+               status: order.status, deliveryStatus: order.deliveryStatus,
+               paymentAddress: order.paymentAddress, totalPriceZec: order.totalPriceZec, attempt };
     } catch (err) {
       const code = err.code ?? '';
+      // A 429 with a long Retry-After is an IP ban, not a blip. Retrying into it
+      // only adds load and cannot succeed inside the drop window, so the run stops.
+      if (err.status === 429 && err.retryAfter >= 60) {
+        if (!rateLimited) {
+          rateLimited = true;
+          log('');
+          log(`!! rate limited by the server: Retry-After ${err.retryAfter}s (${fmtDuration(err.retryAfter * 1000)}).`);
+          log('!! this IP cannot place further orders for that long — stopping the remaining wallets.');
+          log('!! fewer wallets and a larger --gap next time; the limit is per IP, not per wallet.');
+        }
+        return { ok: false, wallet: wallet.address, error: `rate limited (retry after ${err.retryAfter}s)` };
+      }
+      if (rateLimited) return { ok: false, wallet: wallet.address, error: 'skipped: rate limited' };
       if (GLOBAL_FATAL.has(code)) { soldOut = true; return { ok: false, wallet: wallet.address, error: err.message }; }
       if (WALLET_FATAL.has(code)) return { ok: false, wallet: wallet.address, error: `${code}: ${err.message}` };
       const retryable = RETRYABLE.has(code) || err.transient;
@@ -259,18 +320,49 @@ async function mintOne(wallet, quantity) {
   return { ok: false, wallet: wallet.address, error: 'attempts exhausted' };
 }
 
-/** Poll the order until it settles (free mints usually complete immediately). */
-async function confirm(order) {
+/**
+ * Second pass: poll every placed order until it settles. Free mints usually
+ * come back COMPLETED on the first look.
+ */
+async function confirmAll(results) {
+  const placed = results.filter((r) => r.ok && r.orderId && !r.dryRun);
+  if (!placed.length) return;
+  log(`confirming ${placed.length} order(s)...`);
   const done = new Set(['COMPLETED', 'DELIVERED', 'FAILED', 'EXPIRED', 'CANCELLED']);
-  let current = order;
-  for (let i = 0; i < 10 && !done.has(current.status); i++) {
-    await sleep(1_000);
-    current = await api(`/api/mint/orders/${encodeURIComponent(order.id)}`).catch(() => current);
-  }
-  if (current.status === 'AWAITING_PAYMENT' && current.paymentAddress) {
-    log(`  ${short(order.walletAddress ?? '')} needs payment: ${current.totalPriceZec} ZEC -> ${current.paymentAddress}`);
-  }
-  return current;
+
+  await runPool(placed, Math.min(CONCURRENCY, 8), async (r) => {
+    let current = { status: r.status, deliveryStatus: r.deliveryStatus };
+    for (let i = 0; i < 10 && !done.has(current.status); i++) {
+      await sleep(1_000);
+      current = await api(`/api/mint/orders/${encodeURIComponent(r.orderId)}`).catch(() => current);
+    }
+    r.status = current.status;
+    r.deliveryStatus = current.deliveryStatus;
+    if (current.status === 'AWAITING_PAYMENT' && current.paymentAddress) {
+      r.paymentAddress = current.paymentAddress;
+      log(`  ${short(r.wallet)} needs payment: ${current.totalPriceZec} ZEC -> ${current.paymentAddress}`);
+    }
+    return r;
+  });
+}
+
+/**
+ * Open (and keep open) a set of connections before the gate lifts, so the first
+ * orders do not each pay for a TLS handshake. undici drops idle connections
+ * after keepAliveTimeout, so this runs shortly before firing, not minutes ahead.
+ */
+async function warmUp(n = WARM) {
+  if (n < 1) return;
+  const t0 = Date.now();
+  // Warm against a static page: the API endpoints have their own rate buckets
+  // and must not be spent on handshakes.
+  const hits = await Promise.allSettled(
+    Array.from({ length: n }, () => fetch(`${BASE}/launchpad?_w=${Math.random()}`, {
+      method: 'HEAD', cache: 'no-store',
+    })),
+  );
+  const ok = hits.filter((h) => h.status === 'fulfilled').length;
+  log(`warmed ${ok}/${n} connection(s) in ${Date.now() - t0} ms${poolReady ? '' : ' (undici pool unavailable)'}`);
 }
 
 /* ------------------------------------------------------------------ utils */
@@ -291,6 +383,7 @@ async function api(path, init = {}) {
     const err = new Error(data.message || data.error || `Request failed (${res.status})`);
     err.code = data.error || `HTTP_${res.status}`;
     err.status = res.status;
+    err.retryAfter = Number(res.headers.get('retry-after')) || 0;
     err.transient = res.status === 429 || res.status >= 500;
     throw err;
   }
