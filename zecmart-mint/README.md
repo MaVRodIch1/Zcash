@@ -1,5 +1,7 @@
 # ZecMart launchpad mint runner
 
+> Пошаговая инструкция на русском, с нуля и до отчёта: **[ЗАПУСК.md](ЗАПУСК.md)**
+
 Creates one mint order per wallet the moment the ZecMart public sale opens, for every
 address you list. Written for the ZecPuppets drop, but the collection is a flag.
 
