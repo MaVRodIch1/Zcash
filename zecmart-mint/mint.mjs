@@ -14,8 +14,8 @@
  *   --wallets <file>     newline separated wallet addresses (default: wallets.txt)
  *   --collection <slug>  collection slug (default: zecpuppets)
  *   --quantity <n>       NFTs per wallet, capped to maxPerOrder (default: maxPerOrder)
- *   --concurrency <n>    parallel in-flight orders (default: 4)
- *   --gap <ms>           spacing between order starts (default: 300) — the mint
+ *   --concurrency <n>    parallel in-flight orders (default: 2)
+ *   --gap <ms>           spacing between order starts (default: 1000) — the mint
  *                        endpoint answers a burst with a 1-hour IP ban
  *   --poll-ms <ms>       how often to re-check launchAt while waiting (default:
  *                        600000). Rarely, on purpose: the countdown must not
@@ -28,7 +28,10 @@
  *   --attempts <n>       retry attempts per wallet on transient errors (default: 40)
  *   --base <url>         API base (default: https://zecmart.com)
  *   --now                skip the launch countdown and fire immediately
- *   --skip-preflight     do not validate addresses/allowances before firing
+ *   --preflight          validate addresses/allowances first (one request per
+ *                        wallet — spend that budget only in a rehearsal)
+ *   --watch              poll until the mint reopens, then fire (for a drop with
+ *                        no announced launchAt)
  *   --dry-run            run every check, but never POST an order
  *   --warm <n>           connections to open before launch (default: concurrency)
  *   --no-warm            skip connection pre-warming
@@ -58,12 +61,12 @@ const args = parseArgs(process.argv.slice(2));
 const BASE = (args.base ?? 'https://zecmart.com').replace(/\/+$/, '');
 const COLLECTION = args.collection ?? 'zecpuppets';
 const WALLET_FILE = args.wallets ?? 'wallets.txt';
-const CONCURRENCY = int(args.concurrency, 4);
+const CONCURRENCY = int(args.concurrency, 2);
 const LEAD_MS = int(args['lead-ms'], 250);
 const ATTEMPTS = int(args.attempts, 40);
 const DRY_RUN = !!args['dry-run'];
 const WARM = args['no-warm'] ? 0 : int(args.warm, CONCURRENCY);
-const GAP = int(args.gap, 300);  // ms between order starts; the endpoint bans bursts
+const GAP = int(args.gap, 1_000);  // ms between order starts; the endpoint bans bursts
 const POLL_MS = Math.max(60_000, int(args['poll-ms'], 600_000));  // countdown polling interval
 const PREP_MS = Math.max(60_000, int(args['prep-ms'], 900_000));  // silent until this long before launch
 
@@ -115,13 +118,30 @@ async function main() {
   // Everything below talks to the server, so it waits until the prep window.
   if (!args.now) await idleUntilPrep(config);
 
-  await syncClock();
-  if (!args['skip-preflight']) await preflight(wallets);
+  // In watch mode the clock is synced when the mint actually opens; syncing now
+  // would be stale by then, and cost three requests for nothing.
+  if (!args.watch) await syncClock();
+  // Opt-in: preflight costs one request per wallet, and that budget is worth
+  // more spent on orders. Rehearse with it days ahead, not minutes.
+  if (args.preflight) await preflight(wallets);
   if (args.now) await warmUp();
+  else if (args.watch) await waitForOpen();
   else await waitForLaunch();
 
   const t0 = Date.now();
-  const results = await runPool(wallets, CONCURRENCY, (w) => mintOne(w, quantity));
+  // Probe with a single wallet. If the server is rate-limiting, this costs one
+  // request to find out instead of a poolful — and the ban lasts an hour, so
+  // the difference is every remaining wallet.
+  const first = await mintOne(wallets[0], quantity);
+  const results = [first];
+  if (first.ok || !rateLimited) {
+    results.push(...await runPool(wallets.slice(1), CONCURRENCY, (w) => mintOne(w, quantity)));
+  } else {
+    log('first order was rate limited — not sending the rest');
+    for (const w of wallets.slice(1)) {
+      results.push({ ok: false, wallet: w.address, error: 'not attempted: rate limited on the first order' });
+    }
+  }
   log(`all orders sent in ${Date.now() - t0} ms`);
 
   await confirmAll(results);
@@ -187,6 +207,39 @@ async function preflight(wallets) {
 }
 
 /* ------------------------------------------------------------ launch time */
+
+/** Is the collection actually mintable right now, per a fresh config? */
+function isOpen(config) {
+  const status = String(config?.effectiveMintStatus ?? '').toUpperCase();
+  const available = Number(config?.collection?.available ?? 0);
+  return config?.publicMintBlocked === false &&
+         available > 0 &&
+         !['COMING_SOON', 'SOLD_OUT', 'PAUSED'].includes(status);
+}
+
+/**
+ * Watch mode: for a drop with no announced launchAt — a reopen, say. Polls the
+ * config rarely (--poll-ms, 10 min by default) until the mint is open, then
+ * warms up and fires. Polling harder risks the very rate limit that makes the
+ * attempt worth anything.
+ */
+async function waitForOpen() {
+  log(`watching for the mint to open, checking every ${fmtDuration(POLL_MS)}...`);
+  for (;;) {
+    const config = await api('/api/mint/config').catch(() => null);
+    if (config && isOpen(config)) {
+      log(`mint is open: ${config.effectiveMintStatus}, ${config.collection.available} available`);
+      await syncClock();
+      await warmUp();
+      return;
+    }
+    if (config) {
+      log(`still closed (${config.effectiveMintStatus}, blocked=${config.publicMintBlocked}, ` +
+          `available=${config.collection?.available}) — next check in ${fmtDuration(POLL_MS)}`);
+    }
+    await sleep(POLL_MS);
+  }
+}
 
 /**
  * Sleep — sending nothing at all — until shortly before launch.

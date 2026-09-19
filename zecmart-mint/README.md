@@ -127,8 +127,10 @@ Wallet its items show up there too.
 | `--wallets <file>` | `wallets.txt` | Addresses, one per line |
 | `--collection <slug>` | `zecpuppets` | Collection slug |
 | `--quantity <n>` | `maxPerOrder` (2) | NFTs per wallet, capped to the server limit |
-| `--concurrency <n>` | `4` | Orders in flight at once |
-| `--gap <ms>` | `300` | Spacing between order starts |
+| `--concurrency <n>` | `2` | Orders in flight at once |
+| `--gap <ms>` | `1000` | Spacing between order starts |
+| `--watch` | off | Poll until the mint opens, then fire (no announced launchAt) |
+| `--preflight` | off | Validate addresses first — one request per wallet |
 | `--warm <n>` | `= concurrency` | Connections opened before launch |
 | `--prep-ms <ms>` | `900000` | Stay silent until this long before launch |
 | `--poll-ms <ms>` | `600000` | Countdown polling interval |
@@ -137,7 +139,6 @@ Wallet its items show up there too.
 | `--attempts <n>` | `40` | Retries per wallet on transient errors |
 | `--now` | off | Skip the countdown, fire immediately |
 | `--dry-run` | off | Do everything except POST the order |
-| `--skip-preflight` | off | Skip address/allowance validation |
 | `--allow-paid` | off | Proceed on a non-free collection |
 | `--base <url>` | `https://zecmart.com` | API base |
 
@@ -147,8 +148,9 @@ Wallet its items show up there too.
    mint unless you opt in.
 2. Syncs to the server clock (3 samples, keeps the lowest-RTT one), so a skewed local
    clock does not make you early or late.
-3. Preflight: validates every address through `wallet-limits` and reports any whose
-   allowance is already 0 — a typo then costs nothing at t=0.
+3. Preflight (opt-in, `--preflight`): validates every address through `wallet-limits`.
+   It costs one request per wallet, so run it in a rehearsal days ahead — never in
+   the minutes before a drop, where that budget is worth more spent on orders.
 4. Sleeps until `launchAt - lead-ms`, re-checking in case the team moves the time.
 5. Fires orders with bounded concurrency. Each wallet keeps one idempotency key for
    the whole run, so a retry can never produce a second order for that wallet.
@@ -167,8 +169,14 @@ single POST from one address was enough to trigger it.
 What follows from that:
 
 - **More wallets do not mean more NFTs.** Past some number, the run gets banned
-  partway through and the remaining wallets get nothing. A paced 20 beats a
-  stampeding 100.
+  partway through and the remaining wallets get nothing.
+- **Observed on the 2026-09-19 ZecPuppets drop:** 25 wallets, preflighted 15 minutes
+  ahead, then orders at t=0 — the *first* POST came back 429 with `Retry-After: 3600`
+  and not one order landed. Across the whole drop only 43 of 555 went out before the
+  collection was paused, so the server was shedding load broadly, not just from one
+  IP. The preflight's 25 requests almost certainly did not help.
+- Orders now start with a **single probe wallet**: if that one is rate limited, the
+  rest are not attempted, because an hour-long ban costs every one of them anyway.
 - `--gap 300` (the default) spaces the orders. Lower it only if you have reason to
   think the limit is looser than it looked; `--gap 500` is the cautious direction.
 - On a 429 with a long `Retry-After` the run **stops** instead of retrying. Hammering
