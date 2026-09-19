@@ -21,18 +21,87 @@ If the collection is ever a *paid* mint, this runner refuses to run unless you p
 `--allow-paid`; it can create orders but cannot sign or broadcast the payment, so you
 would have to pay each order by hand within the 15-minute reservation window.
 
+## The three scripts
+
+| Script | What it does |
+| --- | --- |
+| `gen-wallets.mjs` | Creates wallets: a BIP-39 seed phrase + `t1` address each |
+| `mint.mjs` | Waits for `launchAt` and fires one order per wallet |
+| `report.mjs` | After the drop: which NFT landed in which wallet |
+
 ## Usage
 
-Requires Node.js 18+ (uses the built-in `fetch`). No dependencies.
+Requires Node.js 18+. `npm install` once (the generator uses `@scure`/`@noble`;
+the mint runner itself has no dependencies).
 
 ```bash
-cp wallets.example.txt wallets.txt   # then paste your addresses, one per line
-node mint.mjs --wallets wallets.txt --dry-run   # rehearse: validates everything, posts nothing
-node mint.mjs --wallets wallets.txt             # waits for launchAt, then fires
+npm install
+
+# 1. Wallets — either paste your own addresses into wallets.txt...
+cp wallets.example.txt wallets.txt
+#    ...or generate them:
+node gen-wallets.mjs --count 25      # writes wallets.txt + wallets-secret.json
+node gen-wallets.mjs --verify        # every address re-derives from its seed phrase
+
+# 2. Rehearse (validates everything, posts nothing)
+node mint.mjs --dry-run --now
+
+# 3. On drop day, a few minutes before launchAt
+node mint.mjs
+
+# 4. Afterwards
+node report.mjs --orders results-*.json
 ```
 
-Start it a few minutes before the drop and leave it running: it syncs to the server
-clock, sleeps until `launchAt`, then sends all orders.
+## Generating wallets
+
+`gen-wallets.mjs` writes two files:
+
+- **`wallets.txt`** — addresses only, used by `mint.mjs` and `report.mjs`.
+- **`wallets-secret.json`** — the seed phrases, `chmod 600` and git-ignored.
+  This file is the *only* key to anything minted to those addresses. Lose it and
+  the NFTs are gone; leak it and they are someone else's.
+
+Derivation is the ordinary stack — BIP-39 mnemonic → BIP-32 → BIP-44
+`m/44'/133'/0'/0/0` → secp256k1 → hash160 → base58check with the Zcash mainnet
+prefix `0x1C 0xB8`. Any BIP-39 wallet recovers the same address. Before
+generating a single key the library self-tests against published vectors (the
+BIP-39 Trezor seed vector and the BIP-44 address `1LqBGSKuX5yYUonjxT5qGfpUsXKYYWeabA`),
+and it aborts rather than emit an address whose seed phrase might not open it.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--count <n>` | — | How many wallets to generate |
+| `--words <12\|24>` | `12` | Seed phrase length |
+| `--mode seeds` | default | One seed phrase per wallet, account 0 — works with any wallet |
+| `--mode accounts` | | One seed phrase, N accounts (`m/44'/133'/i'/0/0`) — a single import, but only correct if the wallet derives accounts the same way |
+| `--append` | off | Add wallets to the existing files |
+| `--show <label>` | | Print one seed phrase, to import it |
+| `--verify` | | Re-derive every address from its seed phrase |
+| `--print` | off | Also print seed phrases to the terminal |
+
+**Verify one before the drop.** Run `node gen-wallets.mjs --show w001`, import that
+seed phrase into Noir Wallet, and check that the wallet's *transparent* address
+matches. That is the only real proof the seeds open the addresses you are about to
+mint to. Note that the ZecMart API does not checksum-validate addresses — it accepted
+a deliberately corrupted one in testing — so a wrong address is accepted happily and
+the NFT lands somewhere nobody controls.
+
+Generate the wallets on the machine that will keep them, not on a shared or remote
+box, and back up `wallets-secret.json` somewhere offline before minting.
+
+## Reading the results
+
+```bash
+node report.mjs --orders results-<timestamp>.json --json report.json
+```
+
+Prints a `wallet -> NFT` table (label, address, item name/number/image), falls back
+to the order status for wallets whose items have not been allocated yet, and totals
+it up. Seed phrases are never read into the report; `--show <label>` prints one when
+you want to import that wallet. `My Collection` on the site queries the connected
+wallet's shielded *and* transparent address, so once a seed is imported into Noir
+Wallet its items show up there too.
 
 ### Flags
 
@@ -68,11 +137,15 @@ clock, sleeps until `launchAt`, then sends all orders.
 
 ## Notes
 
-- `maxPerWallet` is 2 and enforced server-side; the only way to more is more wallets,
-  each of which is a real account you control.
+- `maxPerWallet` is 2 and enforced server-side, per address — more than two means
+  more addresses.
 - Concurrency is deliberately modest and backoff is jittered. Turning it way up mostly
   earns you 429s — the bottleneck is the server, not your loop.
-- `wallets.txt` and `results-*.json` are git-ignored. No private keys or seed phrases
-  are involved anywhere in this flow; never put them in this repo.
+- `wallets.txt`, `wallets-secret.json` and `results-*.json` are git-ignored.
 - The API is undocumented and can change without notice (field names, error codes,
   auth). Re-run with `--dry-run` shortly before the drop to confirm it still matches.
+- Minting across many self-generated wallets is how you get past a per-wallet cap
+  that exists to spread a 555-piece free drop around. That is a choice about other
+  minters, not a technical detail — and platforms do sometimes claw back or blocklist
+  drops they read as sybil activity. No credentials, captchas or rate-limit defences
+  are bypassed anywhere in this tooling.

@@ -1,2 +1,9 @@
+# Seed phrases — never commit these.
+wallets-secret.json
+wallets-secret.json.tmp
+*-secret.json
+
 wallets.txt
 results-*.json
+report*.json
+node_modules/
