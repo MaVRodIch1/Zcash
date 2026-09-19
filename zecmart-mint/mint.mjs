@@ -20,6 +20,10 @@
  *   --poll-ms <ms>       how often to re-check launchAt while waiting (default:
  *                        600000). Rarely, on purpose: the countdown must not
  *                        spend the IP's rate budget before the drop.
+ *   --prep-ms <ms>       start talking to the server this long before launch
+ *                        (default: 900000 = 15 min). Until then the process
+ *                        sleeps without sending anything, so it can be started
+ *                        hours early without burning the rate budget.
  *   --lead-ms <n>        fire this many ms before launchAt (default: 250)
  *   --attempts <n>       retry attempts per wallet on transient errors (default: 40)
  *   --base <url>         API base (default: https://zecmart.com)
@@ -61,6 +65,7 @@ const DRY_RUN = !!args['dry-run'];
 const WARM = args['no-warm'] ? 0 : int(args.warm, CONCURRENCY);
 const GAP = int(args.gap, 300);  // ms between order starts; the endpoint bans bursts
 const POLL_MS = Math.max(60_000, int(args['poll-ms'], 600_000));  // countdown polling interval
+const PREP_MS = Math.max(60_000, int(args['prep-ms'], 900_000));  // silent until this long before launch
 
 // Errors that mean "not open yet / server busy" — worth retrying.
 const RETRYABLE = new Set([
@@ -106,6 +111,9 @@ async function main() {
     log(`warning: collection expects a ZSA recipient (${col.recipientModel}); ` +
         `add "<address>,<zsaRecipient>" lines in the wallet file if orders are rejected.`);
   }
+
+  // Everything below talks to the server, so it waits until the prep window.
+  if (!args.now) await idleUntilPrep(config);
 
   await syncClock();
   if (!args['skip-preflight']) await preflight(wallets);
@@ -179,6 +187,29 @@ async function preflight(wallets) {
 }
 
 /* ------------------------------------------------------------ launch time */
+
+/**
+ * Sleep — sending nothing at all — until shortly before launch.
+ *
+ * The API rate-limits per IP and a 429 carries an hour-long Retry-After, so the
+ * hours before a drop are best spent silent: every request made while waiting is
+ * budget that might not be there at t=0. launchAt comes from the config fetch
+ * that already happened, so this costs no extra request.
+ */
+async function idleUntilPrep(config) {
+  if (!config?.launchAt) return;
+  const target = Date.parse(config.launchAt) - PREP_MS;
+  if (!Number.isFinite(target) || target - Date.now() <= 0) return;
+
+  log(`staying idle until ${new Date(target).toISOString()} ` +
+      `(${fmtDuration(target - Date.now())} from now) — no requests until then`);
+  while (Date.now() < target) {
+    await sleep(Math.min(target - Date.now(), 1_800_000));
+    const left = target - Date.now();
+    if (left > 0) log(`idle... ${fmtDuration(left)} until prep`);
+  }
+  log('prep window reached — checking wallets');
+}
 
 /**
  * Align to the server clock so the countdown is not off by local drift.

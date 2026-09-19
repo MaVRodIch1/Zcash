@@ -130,6 +130,8 @@ Wallet its items show up there too.
 | `--concurrency <n>` | `4` | Orders in flight at once |
 | `--gap <ms>` | `300` | Spacing between order starts |
 | `--warm <n>` | `= concurrency` | Connections opened before launch |
+| `--prep-ms <ms>` | `900000` | Stay silent until this long before launch |
+| `--poll-ms <ms>` | `600000` | Countdown polling interval |
 | `--no-warm` | off | Skip connection pre-warming |
 | `--lead-ms <n>` | `250` | Fire this many ms before `launchAt` |
 | `--attempts <n>` | `40` | Retries per wallet on transient errors |
@@ -173,6 +175,9 @@ What follows from that:
   a one-hour ban cannot succeed and only adds load.
 - Warm-up runs against a static page, not the API, so handshakes do not spend the
   API's rate budget.
+- Started hours early, the runner sends **nothing** until `--prep-ms` before launch
+  (15 min by default), then polls every `--poll-ms` (10 min). A 3.5-hour wait costs
+  about 25 requests rather than 200 — budget that is still there when it matters.
 
 Spreading the orders over many IPs is what would get around this, and that is exactly
 what the limiter exists to prevent. This tooling does not do it.
